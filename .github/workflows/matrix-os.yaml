@@ -174,7 +174,7 @@ jobs:
       # macOS bundle structure) over to the "prerelease" job. These temporary
       # artifacts are deleted as soon as the pre-release has been published.
       - name: Upload Archives for Pre-Release
-        if: github.event_name == 'push' && github.ref_type == 'branch'
+        if: github.ref == 'refs/heads/master'
         uses: actions/upload-artifact@v6
         with:
           name: prerelease-${{ matrix.cache-key }}
@@ -201,7 +201,7 @@ jobs:
     # Runs only after all three builds succeeded, and only for branch pushes:
     # tag pushes already publish a regular release, and pull requests must
     # never publish anything.
-    if: github.event_name == 'push' && github.ref_type == 'branch'
+    if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-24.04
     permissions:
       contents: write # create and delete releases and tags
