@@ -170,6 +170,21 @@ jobs:
           name: PokeFinder-linux-AppImage
           path: PokeFinder-x86_64.AppImage
 
+      # Hand the packaged archives (which preserve file permissions and the
+      # macOS bundle structure) over to the "prerelease" job. These temporary
+      # artifacts are deleted as soon as the pre-release has been published.
+      - name: Upload Archives for Pre-Release
+        if: github.event_name == 'push' && github.ref_type == 'branch'
+        uses: actions/upload-artifact@v6
+        with:
+          name: prerelease-${{ matrix.cache-key }}
+          path: |
+            PokeFinder-*.zip
+            PokeFinder-*.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
       - name: Publish Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
@@ -179,3 +194,159 @@ jobs:
             PokeFinder-linux.tar.gz
             PokeFinder-linux-AppImage.tar.gz
             PokeFinder-macOS.tar.gz
+
+  prerelease:
+    name: Publish Pre-Release
+    needs: ci
+    # Runs only after all three builds succeeded, and only for branch pushes:
+    # tag pushes already publish a regular release, and pull requests must
+    # never publish anything.
+    if: github.event_name == 'push' && github.ref_type == 'branch'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # create and delete releases and tags
+      actions: write # delete the temporary artifacts
+    # Never let two runs publish or delete pre-releases at the same time.
+    concurrency:
+      group: prerelease
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      # Fixed tag of the rolling pre-release, so the links never change:
+      #   https://github.com/<owner>/<repo>/releases/tag/dev-build
+      #   https://github.com/<owner>/<repo>/releases/download/dev-build/<file name>
+      # Only a pre-release with exactly this tag is ever deleted.
+      PRERELEASE_TAG: dev-build
+
+    steps:
+      # If an older run finishes after a newer one, do not let it replace
+      # the newer pre-release with an outdated build. The run number of the
+      # published build is kept in a hidden comment of its release notes.
+      - name: Check for Newer Pre-Release
+        id: check
+        run: |
+          set -euo pipefail
+          published_run=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${PRERELEASE_TAG}" \
+            --jq '.body // "" | capture("<!-- build-run-number: (?<n>[0-9]+) -->").n // "0"' \
+            2>/dev/null || echo 0)
+          if [ "${published_run:-0}" -gt "$GITHUB_RUN_NUMBER" ]; then
+            echo "::notice::Build #${published_run} is newer than this one (#${GITHUB_RUN_NUMBER}); skipping the pre-release."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download Archives
+        if: steps.check.outputs.publish == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: prerelease-*
+          path: assets
+          merge-multiple: true
+
+      # Upload everything to a draft first. A draft is not public and creates
+      # no tag yet, so the current pre-release stays online during the upload.
+      - name: Upload Draft Pre-Release
+        if: steps.check.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+
+          files=(
+            assets/PokeFinder-win.zip
+            assets/PokeFinder-linux.tar.gz
+            assets/PokeFinder-linux-AppImage.tar.gz
+            assets/PokeFinder-macOS.tar.gz
+          )
+          for file in "${files[@]}"; do
+            if [ ! -f "$file" ]; then
+              echo "::error::Missing archive: $file"
+              exit 1
+            fi
+          done
+
+          # Remove drafts left behind by earlier runs that failed halfway.
+          gh release list --limit 1000 --json tagName,isDraft \
+            --jq '.[] | select(.isDraft) | .tagName
+                  | select(startswith(env.PRERELEASE_TAG + "-draft-"))' |
+          while read -r stale_draft; do
+            echo "Deleting stale draft ${stale_draft}"
+            gh release delete "$stale_draft" --yes
+          done
+
+          draft_tag="${PRERELEASE_TAG}-draft-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "DRAFT_TAG=${draft_tag}" >> "$GITHUB_ENV"
+
+          short_sha="${GITHUB_SHA::7}"
+          commit_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          cat > notes.md <<EOF
+          Automated development build of commit [${short_sha}](${commit_url}) on branch **${GITHUB_REF_NAME}** ([workflow run](${run_url})).
+
+          > [!WARNING]
+          > This is not an official release and it may be unstable. It is replaced automatically by the next build. For stable versions, use the latest regular release.
+
+          | Platform | File |
+          | --- | --- |
+          | Windows (x64) | PokeFinder-win.zip |
+          | Linux (binary) | PokeFinder-linux.tar.gz |
+          | Linux (AppImage) | PokeFinder-linux-AppImage.tar.gz |
+          | macOS (Intel + Apple Silicon) | PokeFinder-macOS.tar.gz |
+
+          <!-- build-run-number: ${GITHUB_RUN_NUMBER} -->
+          EOF
+
+          gh release create "$draft_tag" "${files[@]}" \
+            --draft \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "Development build #${GITHUB_RUN_NUMBER} (${GITHUB_REF_NAME} @ ${short_sha})" \
+            --notes-file notes.md
+
+      # Swap the previous pre-release for the new draft. Regular releases and
+      # manually created pre-releases are never touched, and the job stops
+      # without deleting anything if PRERELEASE_TAG is used by a regular
+      # release or if its tag can never be reused (immutable releases).
+      - name: Replace Previous Pre-Release
+        if: steps.check.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+
+          if release_json=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${PRERELEASE_TAG}" 2>/dev/null); then
+            if [ "$(jq -r '.prerelease' <<< "$release_json")" != "true" ]; then
+              echo "::error::Tag ${PRERELEASE_TAG} belongs to a regular release; refusing to delete it."
+              exit 1
+            fi
+            if [ "$(jq -r '.immutable // false' <<< "$release_json")" = "true" ]; then
+              echo "::error::The current pre-release is immutable, so the tag ${PRERELEASE_TAG} can never be reused. Disable immutable releases or use one tag per build."
+              exit 1
+            fi
+            echo "Deleting previous pre-release ${PRERELEASE_TAG}"
+            gh release delete "$PRERELEASE_TAG" --cleanup-tag --yes
+          fi
+
+          # A leftover tag without a release would make the new pre-release
+          # point to an old commit, so remove it as well.
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${PRERELEASE_TAG}" > /dev/null 2>&1; then
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${PRERELEASE_TAG}"
+          fi
+
+          # Publishing the draft creates the tag on the commit that was built.
+          gh release edit "$DRAFT_TAG" \
+            --tag "$PRERELEASE_TAG" \
+            --draft=false \
+            --prerelease \
+            --latest=false
+
+      # Kept on failure on purpose, so that "Re-run failed jobs" still finds
+      # the archives (they expire on their own after one day anyway).
+      - name: Delete Temporary Artifacts
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.name | startswith("prerelease-")) | .id' |
+          while read -r artifact_id; do
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}"
+          done
